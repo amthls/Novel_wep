@@ -1,0 +1,599 @@
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [pg_trgm, uuid_ossp(map: "uuid-ossp")]
+}
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+  binaryTargets   = ["native", "debian-openssl-3.0.x", "linux-musl-openssl-3.0.x"]
+}
+
+enum UserRole {
+  admin
+  mod
+  translator
+  author
+  reader
+
+  @@map("user_role")
+}
+
+enum StoryType {
+  novel
+  manga
+
+  @@map("story_type")
+}
+
+enum StoryStatus {
+  ongoing
+  completed
+  hiatus
+  dropped
+
+  @@map("story_status")
+}
+
+enum ApprovalStatus {
+  pending
+  approved
+  rejected
+
+  @@map("approval_status")
+}
+
+enum GroupRole {
+  leader
+  member
+
+  @@map("group_role")
+}
+
+enum NotificationType {
+  system
+  chapter_update
+  group_invite
+  group_kick
+  group_role_change
+  group_member_add
+  comment_reply
+  bookmark_update
+  post_reaction
+  post_comment
+
+  @@map("notification_type")
+}
+
+enum ReactionType {
+  like
+  love
+  haha
+  wow
+  sad
+  angry
+
+  @@map("reaction_type")
+}
+
+enum CommentTargetType {
+  chapter
+  post
+
+  @@map("comment_target_type")
+}
+
+model User {
+  id             String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  username       String    @unique @db.VarChar(50)
+  email          String    @unique @db.VarChar(255)
+  password_hash  String    @db.VarChar(255)
+  display_name   String?   @db.VarChar(100)
+  avatar_url     String?
+  bio            String?
+  is_banned      Boolean?  @default(false)
+  ban_reason     String?
+  banned_at      DateTime? @db.Timestamptz(6)
+  banned_by      String?   @db.Uuid
+  email_verified Boolean?  @default(false)
+  last_login_at  DateTime? @db.Timestamptz(6)
+  created_at     DateTime? @default(now()) @db.Timestamptz(6)
+  updated_at     DateTime? @default(now()) @db.Timestamptz(6)
+
+  roles          UserRoleModel[]
+  settings       UserSettings?
+  groups_created TranslationGroup[] @relation("GroupCreator")
+  group_members  GroupMember[]
+  stories        Story[]            @relation("StoryUploader")
+  chapters       Chapter[]          @relation("ChapterUploader")
+  ratings        StoryRating[]
+  favorites      UserFavorite[]
+  history        ReadingHistory[]
+  bookmarks      Bookmark[]
+  following      UserFollow[]       @relation("Follower")
+  followers      UserFollow[]       @relation("Following")
+  comments       Comment[]
+  comment_likes  CommentLike[]
+  notifications  Notification[]     @relation("NotificationRecipient")
+  sent_notifs    Notification[]     @relation("NotificationSender")
+  posts          Post[]
+  post_reactions PostReaction[]
+  reports        Report[]           @relation("Reporter")
+
+  @@map("users")
+}
+
+model UserRoleModel {
+  id         String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  user_id    String    @db.Uuid
+  role       UserRole  @default(reader)
+  is_visible Boolean?  @default(true)
+  granted_by String?   @db.Uuid
+  granted_at DateTime? @default(now()) @db.Timestamptz(6)
+
+  user User @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@unique([user_id, role])
+  @@map("user_roles")
+}
+
+model UserSettings {
+  id                    String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  user_id               String    @unique @db.Uuid
+  theme                 String?   @default("dark") @db.VarChar(20)
+  primary_color         String?   @default("#6C5CE7") @db.VarChar(7)
+  font_family           String?   @default("Inter") @db.VarChar(100)
+  font_size             Int?      @default(16)
+  line_height           Decimal?  @default(1.8) @db.Decimal(3, 1)
+  reading_mode          String?   @default("scroll") @db.VarChar(20)
+  brightness            Int?      @default(100)
+  text_color            String?   @default("#E0E0E0") @db.VarChar(7)
+  background_color      String?   @default("#1A1A2E") @db.VarChar(7)
+  notify_chapter_update Boolean?  @default(true)
+  notify_group_events   Boolean?  @default(true)
+  notify_comments       Boolean?  @default(true)
+  notify_system         Boolean?  @default(true)
+  language              String?   @default("vi") @db.VarChar(10)
+  show_mature_content   Boolean?  @default(false)
+  chapters_per_page     Int?      @default(50)
+  created_at            DateTime? @default(now()) @db.Timestamptz(6)
+  updated_at            DateTime? @default(now()) @db.Timestamptz(6)
+
+  user User @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@map("user_settings")
+}
+
+model TagCategory {
+  id         String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  name       String   @unique @db.VarChar(50)
+  label      String   @db.VarChar(100)
+  sort_order Int?     @default(0)
+  tags       Tag[]
+
+  @@map("tag_categories")
+}
+
+model Tag {
+  id          String      @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  category_id String      @db.Uuid
+  name        String      @unique @db.VarChar(100)
+  slug        String      @unique @db.VarChar(100)
+  description String?
+  created_at  DateTime?   @default(now()) @db.Timestamptz(6)
+
+  category    TagCategory @relation(fields: [category_id], references: [id], onDelete: Cascade)
+  stories     StoryTag[]
+  posts       PostTag[]
+
+  @@map("tags")
+}
+
+model TranslationGroup {
+  id          String        @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  name        String        @unique @db.VarChar(200)
+  slug        String        @unique @db.VarChar(200)
+  description String?
+  avatar_url  String?
+  banner_url  String?
+  website_url String?
+  discord_url String?
+  is_active   Boolean?      @default(true)
+  created_by  String        @db.Uuid
+  created_at  DateTime?     @default(now()) @db.Timestamptz(6)
+  updated_at  DateTime?     @default(now()) @db.Timestamptz(6)
+
+  creator     User          @relation("GroupCreator", fields: [created_by], references: [id])
+  members     GroupMember[]
+  stories     Story[]
+  chapters    Chapter[]
+
+  @@map("translation_groups")
+}
+
+model GroupMember {
+  id        String           @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  group_id  String           @db.Uuid
+  user_id   String           @db.Uuid
+  role      GroupRole        @default(member)
+  joined_at DateTime?        @default(now()) @db.Timestamptz(6)
+
+  group     TranslationGroup @relation(fields: [group_id], references: [id], onDelete: Cascade)
+  user      User             @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@unique([group_id, user_id])
+  @@map("group_members")
+}
+
+model Story {
+  id                  String            @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  title               String            @db.VarChar(500)
+  slug                String            @unique @db.VarChar(500)
+  original_title      String?           @db.VarChar(500)
+  synopsis            String?
+  cover_image_url     String?
+  banner_image_url    String?
+  story_type          StoryType         @default(novel)
+  status              StoryStatus       @default(ongoing)
+  approval_status     ApprovalStatus?   @default(pending)
+  approved_by         String?           @db.Uuid
+  approved_at         DateTime?         @db.Timestamptz(6)
+  rejection_reason    String?
+  uploader_id         String            @db.Uuid
+  group_id            String?           @db.Uuid
+  original_language   String?           @default("ja") @db.VarChar(10)
+  translated_language String?           @default("vi") @db.VarChar(10)
+  author_name         String?           @db.VarChar(200)
+  artist_name         String?           @db.VarChar(200)
+  year_published      Int?
+  total_chapters      Int?              @default(0)
+  total_volumes       Int?              @default(0)
+  total_views         BigInt?           @default(0)
+  total_favorites     BigInt?           @default(0)
+  total_bookmarks     BigInt?           @default(0)
+  total_comments      BigInt?           @default(0)
+  rating_avg          Decimal?          @default(0) @db.Decimal(3, 2)
+  rating_count        Int?              @default(0)
+  last_chapter_at     DateTime?         @db.Timestamptz(6)
+  created_at          DateTime?         @default(now()) @db.Timestamptz(6)
+  updated_at          DateTime?         @default(now()) @db.Timestamptz(6)
+
+  uploader            User              @relation("StoryUploader", fields: [uploader_id], references: [id])
+  group               TranslationGroup? @relation(fields: [group_id], references: [id], onDelete: SetNull)
+  tags                StoryTag[]
+  volumes             Volume[]
+  chapters            Chapter[]
+  ratings             StoryRating[]
+  favorites           UserFavorite[]
+  history             ReadingHistory[]
+  bookmarks           Bookmark[]
+  views               StoryView[]
+  daily_views         StoryViewsDaily[]
+  posts               Post[]
+
+  @@map("stories")
+}
+
+model StoryTag {
+  story_id String @db.Uuid
+  tag_id   String @db.Uuid
+
+  story    Story  @relation(fields: [story_id], references: [id], onDelete: Cascade)
+  tag      Tag    @relation(fields: [tag_id], references: [id], onDelete: Cascade)
+
+  @@id([story_id, tag_id])
+  @@map("story_tags")
+}
+
+model Volume {
+  id              String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  story_id        String    @db.Uuid
+  title           String    @db.VarChar(500)
+  volume_number   Int
+  cover_image_url String?
+  description     String?
+  sort_order      Int?      @default(0)
+  created_at      DateTime? @default(now()) @db.Timestamptz(6)
+  updated_at      DateTime? @default(now()) @db.Timestamptz(6)
+
+  story           Story     @relation(fields: [story_id], references: [id], onDelete: Cascade)
+  chapters        Chapter[]
+
+  @@unique([story_id, volume_number])
+  @@map("volumes")
+}
+
+model Chapter {
+  id               String            @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  story_id         String            @db.Uuid
+  volume_id        String?           @db.Uuid
+  title            String            @db.VarChar(500)
+  chapter_number   Decimal           @db.Decimal(10, 2)
+  slug             String            @db.VarChar(500)
+  content          String?
+  word_count       Int?              @default(0)
+  is_published     Boolean?          @default(true)
+  approval_status  ApprovalStatus?   @default(pending)
+  uploader_id      String            @db.Uuid
+  group_id         String?           @db.Uuid
+  translator_notes Json?
+  total_views      BigInt?           @default(0)
+  total_comments   BigInt?           @default(0)
+  published_at     DateTime?         @default(now()) @db.Timestamptz(6)
+  created_at       DateTime?         @default(now()) @db.Timestamptz(6)
+  updated_at       DateTime?         @default(now()) @db.Timestamptz(6)
+
+  story            Story             @relation(fields: [story_id], references: [id], onDelete: Cascade)
+  volume           Volume?           @relation(fields: [volume_id], references: [id], onDelete: SetNull)
+  uploader         User              @relation("ChapterUploader", fields: [uploader_id], references: [id])
+  group            TranslationGroup? @relation(fields: [group_id], references: [id], onDelete: SetNull)
+  pages            ChapterPage[]
+  history          ReadingHistory[]
+  bookmarks        Bookmark[]
+  views            StoryView[]
+
+  @@unique([story_id, chapter_number])
+  @@map("chapters")
+}
+
+model ChapterPage {
+  id          String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  chapter_id  String    @db.Uuid
+  page_number Int
+  image_url   String
+  width       Int?
+  height      Int?
+  file_size   BigInt?
+  created_at  DateTime? @default(now()) @db.Timestamptz(6)
+
+  chapter     Chapter   @relation(fields: [chapter_id], references: [id], onDelete: Cascade)
+
+  @@unique([chapter_id, page_number])
+  @@map("chapter_pages")
+}
+
+model StoryView {
+  id         String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  story_id   String    @db.Uuid
+  chapter_id String?   @db.Uuid
+  user_id    String?   @db.Uuid
+  ip_address String?
+  user_agent String?
+  viewed_at  DateTime? @default(now()) @db.Timestamptz(6)
+
+  story      Story     @relation(fields: [story_id], references: [id], onDelete: Cascade)
+  chapter    Chapter?  @relation(fields: [chapter_id], references: [id], onDelete: Cascade)
+
+  @@map("story_views")
+}
+
+model StoryViewsDaily {
+  id             String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  story_id       String   @db.Uuid
+  view_date      DateTime @db.Date
+  view_count     BigInt?  @default(0)
+  unique_viewers BigInt?  @default(0)
+
+  story          Story    @relation(fields: [story_id], references: [id], onDelete: Cascade)
+
+  @@unique([story_id, view_date])
+  @@map("story_views_daily")
+}
+
+model StoryRating {
+  id         String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  story_id   String    @db.Uuid
+  user_id    String    @db.Uuid
+  rating     Int       @db.SmallInt
+  review     String?
+  created_at DateTime? @default(now()) @db.Timestamptz(6)
+  updated_at DateTime? @default(now()) @db.Timestamptz(6)
+
+  story      Story     @relation(fields: [story_id], references: [id], onDelete: Cascade)
+  user       User      @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@unique([story_id, user_id])
+  @@map("story_ratings")
+}
+
+model UserFavorite {
+  id             String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  user_id        String    @db.Uuid
+  story_id       String    @db.Uuid
+  category       String?   @default("default") @db.VarChar(50)
+  notify_updates Boolean?  @default(true)
+  created_at     DateTime? @default(now()) @db.Timestamptz(6)
+
+  user           User      @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  story          Story     @relation(fields: [story_id], references: [id], onDelete: Cascade)
+
+  @@unique([user_id, story_id])
+  @@map("user_favorites")
+}
+
+model ReadingHistory {
+  id                 String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  user_id            String    @db.Uuid
+  story_id           String    @db.Uuid
+  chapter_id         String    @db.Uuid
+  scroll_position    Decimal?  @default(0) @db.Decimal(5, 2)
+  page_number        Int?
+  read_at            DateTime? @default(now()) @db.Timestamptz(6)
+  time_spent_seconds Int?      @default(0)
+
+  user               User      @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  story              Story     @relation(fields: [story_id], references: [id], onDelete: Cascade)
+  chapter            Chapter   @relation(fields: [chapter_id], references: [id], onDelete: Cascade)
+
+  @@unique([user_id, chapter_id])
+  @@map("reading_history")
+}
+
+model Bookmark {
+  id              String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  user_id         String    @db.Uuid
+  story_id        String    @db.Uuid
+  chapter_id      String    @db.Uuid
+  line_text       String?
+  line_index      Int?
+  scroll_position Decimal?  @db.Decimal(5, 2)
+  page_number     Int?
+  note            String?
+  color           String?   @default("#FFD700") @db.VarChar(7)
+  created_at      DateTime? @default(now()) @db.Timestamptz(6)
+
+  user            User      @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  story           Story     @relation(fields: [story_id], references: [id], onDelete: Cascade)
+  chapter         Chapter   @relation(fields: [chapter_id], references: [id], onDelete: Cascade)
+
+  @@map("bookmarks")
+}
+
+model UserFollow {
+  id           String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  follower_id  String    @db.Uuid
+  following_id String    @db.Uuid
+  created_at   DateTime? @default(now()) @db.Timestamptz(6)
+
+  follower     User      @relation("Follower", fields: [follower_id], references: [id], onDelete: Cascade)
+  following    User      @relation("Following", fields: [following_id], references: [id], onDelete: Cascade)
+
+  @@unique([follower_id, following_id])
+  @@map("user_follows")
+}
+
+model Comment {
+  id          String            @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  user_id     String            @db.Uuid
+  target_type CommentTargetType
+  target_id   String            @db.Uuid
+  parent_id   String?           @db.Uuid
+  root_id     String?           @db.Uuid
+  depth       Int?              @default(0)
+  content     String
+  is_edited   Boolean?          @default(false)
+  is_deleted  Boolean?          @default(false)
+  quoted_text String?
+  like_count  Int?              @default(0)
+  reply_count Int?              @default(0)
+  created_at  DateTime?         @default(now()) @db.Timestamptz(6)
+  updated_at  DateTime?         @default(now()) @db.Timestamptz(6)
+
+  user        User              @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  parent      Comment?          @relation("CommentReplies", fields: [parent_id], references: [id], onDelete: Cascade)
+  replies     Comment[]         @relation("CommentReplies")
+  likes       CommentLike[]
+
+  @@map("comments")
+}
+
+model CommentLike {
+  user_id    String    @db.Uuid
+  comment_id String    @db.Uuid
+  created_at DateTime? @default(now()) @db.Timestamptz(6)
+
+  user       User      @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  comment    Comment   @relation(fields: [comment_id], references: [id], onDelete: Cascade)
+
+  @@id([user_id, comment_id])
+  @@map("comment_likes")
+}
+
+model Notification {
+  id             String           @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  user_id        String           @db.Uuid
+  type           NotificationType
+  title          String           @db.VarChar(300)
+  message        String?
+  reference_type String?          @db.VarChar(50)
+  reference_id   String?          @db.Uuid
+  sender_id      String?          @db.Uuid
+  is_read        Boolean?         @default(false)
+  read_at        DateTime?        @db.Timestamptz(6)
+  created_at     DateTime?        @default(now()) @db.Timestamptz(6)
+
+  user           User             @relation("NotificationRecipient", fields: [user_id], references: [id], onDelete: Cascade)
+  sender         User?            @relation("NotificationSender", fields: [sender_id], references: [id], onDelete: SetNull)
+
+  @@map("notifications")
+}
+
+model BroadcastNotification {
+  id         String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  sender_id  String    @db.Uuid
+  title      String    @db.VarChar(300)
+  message    String
+  is_active  Boolean?  @default(true)
+  created_at DateTime? @default(now()) @db.Timestamptz(6)
+
+  @@map("broadcast_notifications")
+}
+
+model Post {
+  id              String         @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  user_id         String         @db.Uuid
+  title           String         @db.VarChar(500)
+  slug            String         @unique @db.VarChar(500)
+  content         String
+  cover_image_url String?
+  story_id        String?        @db.Uuid
+  is_published    Boolean?       @default(true)
+  is_deleted      Boolean?       @default(false)
+  view_count      BigInt?        @default(0)
+  comment_count   Int?           @default(0)
+  reaction_count  Int?           @default(0)
+  published_at    DateTime?      @default(now()) @db.Timestamptz(6)
+  created_at      DateTime?      @default(now()) @db.Timestamptz(6)
+  updated_at      DateTime?      @default(now()) @db.Timestamptz(6)
+
+  user            User           @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  story           Story?         @relation(fields: [story_id], references: [id], onDelete: SetNull)
+  tags            PostTag[]
+  reactions       PostReaction[]
+
+  @@map("posts")
+}
+
+model PostTag {
+  post_id String @db.Uuid
+  tag_id  String @db.Uuid
+
+  post    Post   @relation(fields: [post_id], references: [id], onDelete: Cascade)
+  tag     Tag    @relation(fields: [tag_id], references: [id], onDelete: Cascade)
+
+  @@id([post_id, tag_id])
+  @@map("post_tags")
+}
+
+model PostReaction {
+  id         String       @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  post_id    String       @db.Uuid
+  user_id    String       @db.Uuid
+  reaction   ReactionType
+  created_at DateTime?    @default(now()) @db.Timestamptz(6)
+
+  post       Post         @relation(fields: [post_id], references: [id], onDelete: Cascade)
+  user       User         @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@unique([post_id, user_id])
+  @@map("post_reactions")
+}
+
+model Report {
+  id              String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  reporter_id     String    @db.Uuid
+  target_type     String    @db.VarChar(50)
+  target_id       String    @db.Uuid
+  reason          String    @db.VarChar(100)
+  description     String?
+  status          String?   @default("pending") @db.VarChar(20)
+  resolved_by     String?   @db.Uuid
+  resolved_at     DateTime? @db.Timestamptz(6)
+  resolution_note String?
+  created_at      DateTime? @default(now()) @db.Timestamptz(6)
+
+  reporter        User      @relation("Reporter", fields: [reporter_id], references: [id], onDelete: Cascade)
+
+  @@map("reports")
+}

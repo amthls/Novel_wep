@@ -1,0 +1,1006 @@
+-- ============================================================================
+-- DATABASE SCHEMA: Hệ thống đọc truyện (Light Novel / Manga Platform)
+-- Database: PostgreSQL
+-- Version: 1.0
+-- Created: 2026-09-02
+-- ============================================================================
+
+-- Reset Schema if needed
+DROP SCHEMA IF EXISTS public CASCADE;
+CREATE SCHEMA public;
+GRANT ALL ON SCHEMA public TO postgres;
+GRANT ALL ON SCHEMA public TO public;
+
+-- ============================================================================
+-- EXTENSIONS
+-- ============================================================================
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pg_trgm";  -- Full-text search support
+
+-- ============================================================================
+-- ENUM TYPES
+-- ============================================================================
+
+-- Vai trò người dùng
+CREATE TYPE user_role AS ENUM ('admin', 'mod', 'translator', 'author', 'reader');
+
+-- Loại truyện
+CREATE TYPE story_type AS ENUM ('novel', 'manga');
+
+-- Trạng thái truyện
+CREATE TYPE story_status AS ENUM ('ongoing', 'completed', 'hiatus', 'dropped');
+
+-- Trạng thái duyệt
+CREATE TYPE approval_status AS ENUM ('pending', 'approved', 'rejected');
+
+-- Vai trò trong nhóm dịch
+CREATE TYPE group_role AS ENUM ('leader', 'member');
+
+-- Loại thông báo
+CREATE TYPE notification_type AS ENUM (
+    'system',           -- Thông báo hệ thống từ admin/mod
+    'chapter_update',   -- Truyện cập nhật chương mới
+    'group_invite',     -- Được mời vào nhóm dịch
+    'group_kick',       -- Bị loại khỏi nhóm
+    'group_role_change',-- Thay đổi vai trò trong nhóm
+    'group_member_add', -- Thành viên mới được thêm
+    'comment_reply',    -- Ai đó reply comment
+    'bookmark_update',  -- Truyện bookmark có cập nhật
+    'post_reaction',    -- Ai đó react bài viết
+    'post_comment'      -- Ai đó comment bài viết
+);
+
+-- Loại cảm xúc (reaction)
+CREATE TYPE reaction_type AS ENUM ('like', 'love', 'haha', 'wow', 'sad', 'angry');
+
+-- Loại nội dung cho comment
+CREATE TYPE comment_target_type AS ENUM ('chapter', 'post');
+
+-- ============================================================================
+-- 1. BẢNG NGƯỜI DÙNG (ACCOUNTS)
+-- ============================================================================
+
+CREATE TABLE users (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    username        VARCHAR(50) NOT NULL UNIQUE,
+    email           VARCHAR(255) NOT NULL UNIQUE,
+    password_hash   VARCHAR(255) NOT NULL,
+    display_name    VARCHAR(100),
+    avatar_url      TEXT,
+    bio             TEXT,
+    is_banned       BOOLEAN DEFAULT FALSE,
+    ban_reason      TEXT,
+    banned_at       TIMESTAMPTZ,
+    banned_by       UUID REFERENCES users(id),
+    email_verified  BOOLEAN DEFAULT FALSE,
+    last_login_at   TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_users_username ON users(username);
+CREATE INDEX idx_users_email ON users(email);
+CREATE INDEX idx_users_username_trgm ON users USING gin(username gin_trgm_ops);
+
+-- ============================================================================
+-- 2. BẢNG PHÂN QUYỀN (USER ROLES)
+-- Một user có thể có nhiều role, hiển thị role bên cạnh tên
+-- ============================================================================
+
+CREATE TABLE user_roles (
+    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role        user_role NOT NULL DEFAULT 'reader',
+    is_visible  BOOLEAN DEFAULT TRUE,  -- Cho phép hiển thị role bên cạnh tên
+    granted_by  UUID REFERENCES users(id),
+    granted_at  TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(user_id, role)
+);
+
+CREATE INDEX idx_user_roles_user ON user_roles(user_id);
+
+-- ============================================================================
+-- 3. CÀI ĐẶT NGƯỜI DÙNG (USER SETTINGS)
+-- ============================================================================
+
+CREATE TABLE user_settings (
+    id                  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id             UUID NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+    -- Giao diện
+    theme               VARCHAR(20) DEFAULT 'dark',         -- 'dark', 'light', 'sepia', 'amoled'
+    primary_color       VARCHAR(7) DEFAULT '#6C5CE7',       -- Hex color
+    -- Đọc truyện
+    font_family         VARCHAR(100) DEFAULT 'Inter',
+    font_size           INTEGER DEFAULT 16,                 -- px
+    line_height         DECIMAL(3,1) DEFAULT 1.8,
+    reading_mode        VARCHAR(20) DEFAULT 'scroll',       -- 'scroll', 'paginated', 'webtoon'
+    brightness          INTEGER DEFAULT 100,                -- 0-100%
+    text_color          VARCHAR(7) DEFAULT '#E0E0E0',
+    background_color    VARCHAR(7) DEFAULT '#1A1A2E',
+    -- Thông báo
+    notify_chapter_update   BOOLEAN DEFAULT TRUE,
+    notify_group_events     BOOLEAN DEFAULT TRUE,
+    notify_comments         BOOLEAN DEFAULT TRUE,
+    notify_system           BOOLEAN DEFAULT TRUE,
+    -- Ngôn ngữ
+    language            VARCHAR(10) DEFAULT 'vi',
+    -- Khác
+    show_mature_content BOOLEAN DEFAULT FALSE,
+    chapters_per_page   INTEGER DEFAULT 50,
+    created_at          TIMESTAMPTZ DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ============================================================================
+-- 4. HỆ THỐNG TAG
+-- ============================================================================
+
+CREATE TABLE tag_categories (
+    id      UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name    VARCHAR(50) NOT NULL UNIQUE,   -- 'genre', 'theme', 'demographic', 'format', 'content_warning'
+    label   VARCHAR(100) NOT NULL,         -- Tên hiển thị
+    sort_order INTEGER DEFAULT 0
+);
+
+CREATE TABLE tags (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    category_id     UUID NOT NULL REFERENCES tag_categories(id) ON DELETE CASCADE,
+    name            VARCHAR(100) NOT NULL UNIQUE,
+    slug            VARCHAR(100) NOT NULL UNIQUE,
+    description     TEXT,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_tags_category ON tags(category_id);
+CREATE INDEX idx_tags_slug ON tags(slug);
+CREATE INDEX idx_tags_name_trgm ON tags USING gin(name gin_trgm_ops);
+
+-- ============================================================================
+-- 5. NHÓM DỊCH (TRANSLATION GROUPS)
+-- ============================================================================
+
+CREATE TABLE translation_groups (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name            VARCHAR(200) NOT NULL UNIQUE,
+    slug            VARCHAR(200) NOT NULL UNIQUE,
+    description     TEXT,
+    avatar_url      TEXT,
+    banner_url      TEXT,
+    website_url     TEXT,
+    discord_url     TEXT,
+    is_active       BOOLEAN DEFAULT TRUE,
+    created_by      UUID NOT NULL REFERENCES users(id),
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_groups_slug ON translation_groups(slug);
+CREATE INDEX idx_groups_name_trgm ON translation_groups USING gin(name gin_trgm_ops);
+
+CREATE TABLE group_members (
+    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    group_id    UUID NOT NULL REFERENCES translation_groups(id) ON DELETE CASCADE,
+    user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role        group_role NOT NULL DEFAULT 'member',
+    joined_at   TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(group_id, user_id)
+);
+
+CREATE INDEX idx_group_members_group ON group_members(group_id);
+CREATE INDEX idx_group_members_user ON group_members(user_id);
+
+-- ============================================================================
+-- 6. TRUYỆN (STORIES)
+-- ============================================================================
+
+CREATE TABLE stories (
+    id                  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    title               VARCHAR(500) NOT NULL,
+    slug                VARCHAR(500) NOT NULL UNIQUE,
+    original_title      VARCHAR(500),
+    synopsis            TEXT,
+    cover_image_url     TEXT,
+    banner_image_url    TEXT,
+    story_type          story_type NOT NULL DEFAULT 'novel',
+    status              story_status NOT NULL DEFAULT 'ongoing',
+    approval_status     approval_status DEFAULT 'pending',
+    approved_by         UUID REFERENCES users(id),
+    approved_at         TIMESTAMPTZ,
+    rejection_reason    TEXT,
+    uploader_id         UUID NOT NULL REFERENCES users(id),
+    group_id            UUID REFERENCES translation_groups(id) ON DELETE SET NULL,
+    original_language   VARCHAR(10) DEFAULT 'ja',
+    translated_language VARCHAR(10) DEFAULT 'vi',
+    author_name         VARCHAR(200),
+    artist_name         VARCHAR(200),
+    year_published      INTEGER,
+    total_chapters      INTEGER DEFAULT 0,
+    total_volumes       INTEGER DEFAULT 0,
+    total_views         BIGINT DEFAULT 0,
+    total_favorites     BIGINT DEFAULT 0,
+    total_bookmarks     BIGINT DEFAULT 0,
+    total_comments      BIGINT DEFAULT 0,
+    rating_avg          DECIMAL(3,2) DEFAULT 0,
+    rating_count        INTEGER DEFAULT 0,
+    last_chapter_at     TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_stories_slug ON stories(slug);
+CREATE INDEX idx_stories_uploader ON stories(uploader_id);
+CREATE INDEX idx_stories_group ON stories(group_id);
+CREATE INDEX idx_stories_type ON stories(story_type);
+CREATE INDEX idx_stories_status ON stories(status);
+CREATE INDEX idx_stories_approval ON stories(approval_status);
+CREATE INDEX idx_stories_views ON stories(total_views DESC);
+CREATE INDEX idx_stories_favorites ON stories(total_favorites DESC);
+CREATE INDEX idx_stories_rating ON stories(rating_avg DESC);
+CREATE INDEX idx_stories_last_chapter ON stories(last_chapter_at DESC NULLS LAST);
+CREATE INDEX idx_stories_created ON stories(created_at DESC);
+CREATE INDEX idx_stories_title_trgm ON stories USING gin(title gin_trgm_ops);
+
+CREATE TABLE story_tags (
+    story_id    UUID NOT NULL REFERENCES stories(id) ON DELETE CASCADE,
+    tag_id      UUID NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+    PRIMARY KEY (story_id, tag_id)
+);
+
+CREATE INDEX idx_story_tags_story ON story_tags(story_id);
+CREATE INDEX idx_story_tags_tag ON story_tags(tag_id);
+
+-- ============================================================================
+-- 7. VOLUMES (Tập truyện)
+-- ============================================================================
+
+CREATE TABLE volumes (
+    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    story_id    UUID NOT NULL REFERENCES stories(id) ON DELETE CASCADE,
+    title       VARCHAR(500) NOT NULL,
+    volume_number INTEGER NOT NULL,
+    cover_image_url TEXT,
+    description TEXT,
+    sort_order  INTEGER DEFAULT 0,
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(story_id, volume_number)
+);
+
+CREATE INDEX idx_volumes_story ON volumes(story_id);
+
+-- ============================================================================
+-- 8. CHƯƠNG TRUYỆN (CHAPTERS)
+-- ============================================================================
+
+CREATE TABLE chapters (
+    id                  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    story_id            UUID NOT NULL REFERENCES stories(id) ON DELETE CASCADE,
+    volume_id           UUID REFERENCES volumes(id) ON DELETE SET NULL,
+    title               VARCHAR(500) NOT NULL,
+    chapter_number      DECIMAL(10,2) NOT NULL,
+    slug                VARCHAR(500) NOT NULL,
+    content             TEXT,
+    word_count          INTEGER DEFAULT 0,
+    is_published        BOOLEAN DEFAULT TRUE,
+    approval_status     approval_status DEFAULT 'pending',
+    uploader_id         UUID NOT NULL REFERENCES users(id),
+    group_id            UUID REFERENCES translation_groups(id) ON DELETE SET NULL,
+    translator_notes    JSONB,
+    total_views         BIGINT DEFAULT 0,
+    total_comments      BIGINT DEFAULT 0,
+    published_at        TIMESTAMPTZ DEFAULT NOW(),
+    created_at          TIMESTAMPTZ DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(story_id, chapter_number)
+);
+
+CREATE INDEX idx_chapters_story ON chapters(story_id);
+CREATE INDEX idx_chapters_volume ON chapters(volume_id);
+CREATE INDEX idx_chapters_story_number ON chapters(story_id, chapter_number);
+CREATE INDEX idx_chapters_published ON chapters(published_at DESC);
+CREATE INDEX idx_chapters_slug ON chapters(slug);
+
+-- ============================================================================
+-- 9. TRANG TRUYỆN TRANH (MANGA PAGES)
+-- ============================================================================
+
+CREATE TABLE chapter_pages (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    chapter_id      UUID NOT NULL REFERENCES chapters(id) ON DELETE CASCADE,
+    page_number     INTEGER NOT NULL,
+    image_url       TEXT NOT NULL,
+    width           INTEGER,
+    height          INTEGER,
+    file_size       BIGINT,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(chapter_id, page_number)
+);
+
+CREATE INDEX idx_chapter_pages_chapter ON chapter_pages(chapter_id);
+
+-- ============================================================================
+-- 10. LƯỢT XEM (VIEW TRACKING)
+-- ============================================================================
+
+CREATE TABLE story_views (
+    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    story_id    UUID NOT NULL REFERENCES stories(id) ON DELETE CASCADE,
+    chapter_id  UUID REFERENCES chapters(id) ON DELETE CASCADE,
+    user_id     UUID REFERENCES users(id) ON DELETE SET NULL,
+    ip_address  INET,
+    user_agent  TEXT,
+    viewed_at   TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_story_views_story ON story_views(story_id);
+CREATE INDEX idx_story_views_chapter ON story_views(chapter_id);
+CREATE INDEX idx_story_views_user ON story_views(user_id);
+CREATE INDEX idx_story_views_time ON story_views(viewed_at DESC);
+
+CREATE TABLE story_views_daily (
+    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    story_id    UUID NOT NULL REFERENCES stories(id) ON DELETE CASCADE,
+    view_date   DATE NOT NULL,
+    view_count  BIGINT DEFAULT 0,
+    unique_viewers BIGINT DEFAULT 0,
+    UNIQUE(story_id, view_date)
+);
+
+CREATE INDEX idx_views_daily_story_date ON story_views_daily(story_id, view_date DESC);
+
+-- ============================================================================
+-- 11. ĐÁNH GIÁ TRUYỆN (RATINGS)
+-- ============================================================================
+
+CREATE TABLE story_ratings (
+    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    story_id    UUID NOT NULL REFERENCES stories(id) ON DELETE CASCADE,
+    user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    rating      SMALLINT NOT NULL CHECK (rating >= 1 AND rating <= 10),
+    review      TEXT,
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(story_id, user_id)
+);
+
+CREATE INDEX idx_ratings_story ON story_ratings(story_id);
+
+-- ============================================================================
+-- 12. YÊU THÍCH TRUYỆN (FAVORITES / THƯ VIỆN)
+-- ============================================================================
+
+CREATE TABLE user_favorites (
+    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    story_id    UUID NOT NULL REFERENCES stories(id) ON DELETE CASCADE,
+    category    VARCHAR(50) DEFAULT 'default',
+    notify_updates BOOLEAN DEFAULT TRUE,
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(user_id, story_id)
+);
+
+CREATE INDEX idx_favorites_user ON user_favorites(user_id);
+CREATE INDEX idx_favorites_story ON user_favorites(story_id);
+
+-- ============================================================================
+-- 13. LỊCH SỬ ĐỌC (READING HISTORY)
+-- ============================================================================
+
+CREATE TABLE reading_history (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    story_id        UUID NOT NULL REFERENCES stories(id) ON DELETE CASCADE,
+    chapter_id      UUID NOT NULL REFERENCES chapters(id) ON DELETE CASCADE,
+    scroll_position DECIMAL(5,2) DEFAULT 0,
+    page_number     INTEGER,
+    read_at         TIMESTAMPTZ DEFAULT NOW(),
+    time_spent_seconds INTEGER DEFAULT 0
+);
+
+CREATE INDEX idx_reading_history_chapter ON reading_history(user_id, chapter_id);
+CREATE INDEX idx_reading_history_user ON reading_history(user_id, read_at DESC);
+CREATE INDEX idx_reading_history_story ON reading_history(story_id);
+
+-- ============================================================================
+-- 14. BOOKMARK (Đánh dấu chương + dòng)
+-- ============================================================================
+
+CREATE TABLE bookmarks (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    story_id        UUID NOT NULL REFERENCES stories(id) ON DELETE CASCADE,
+    chapter_id      UUID NOT NULL REFERENCES chapters(id) ON DELETE CASCADE,
+    line_text       TEXT,
+    line_index      INTEGER,
+    scroll_position DECIMAL(5,2),
+    page_number     INTEGER,
+    note            TEXT,
+    color           VARCHAR(7) DEFAULT '#FFD700',
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_bookmarks_user ON bookmarks(user_id);
+CREATE INDEX idx_bookmarks_story ON bookmarks(user_id, story_id);
+CREATE INDEX idx_bookmarks_chapter ON bookmarks(chapter_id);
+CREATE INDEX IF NOT EXISTS idx_bookmarks_lookup ON bookmarks(user_id, chapter_id, line_index);
+CREATE INDEX IF NOT EXISTS idx_bookmarks_created ON bookmarks(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_favorites_created ON user_favorites(created_at DESC);
+
+-- ============================================================================
+-- 15. THEO DÕI DỊCH GIẢ
+-- ============================================================================
+
+CREATE TABLE user_follows (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    follower_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    following_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(follower_id, following_id),
+    CHECK(follower_id != following_id)
+);
+
+CREATE INDEX idx_follows_follower ON user_follows(follower_id);
+CREATE INDEX idx_follows_following ON user_follows(following_id);
+
+-- ============================================================================
+-- 16. HỆ THỐNG COMMENT
+-- ============================================================================
+
+CREATE TABLE comments (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    target_type     comment_target_type NOT NULL,
+    target_id       UUID NOT NULL,
+    parent_id       UUID REFERENCES comments(id) ON DELETE CASCADE,
+    root_id         UUID REFERENCES comments(id) ON DELETE CASCADE,
+    depth           INTEGER DEFAULT 0,
+    content         TEXT NOT NULL,
+    is_edited       BOOLEAN DEFAULT FALSE,
+    is_deleted       BOOLEAN DEFAULT FALSE,
+    quoted_text     TEXT,
+    like_count      INTEGER DEFAULT 0,
+    reply_count     INTEGER DEFAULT 0,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_comments_target ON comments(target_type, target_id);
+CREATE INDEX idx_comments_user ON comments(user_id);
+CREATE INDEX idx_comments_parent ON comments(parent_id);
+CREATE INDEX idx_comments_root ON comments(root_id);
+CREATE INDEX idx_comments_created ON comments(created_at DESC);
+
+CREATE TABLE comment_likes (
+    user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    comment_id  UUID NOT NULL REFERENCES comments(id) ON DELETE CASCADE,
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (user_id, comment_id)
+);
+
+-- ============================================================================
+-- 17. HỆ THỐNG THÔNG BÁO (NOTIFICATIONS)
+-- ============================================================================
+
+CREATE TABLE notifications (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    type            notification_type NOT NULL,
+    title           VARCHAR(300) NOT NULL,
+    message         TEXT,
+    reference_type  VARCHAR(50),
+    reference_id    UUID,
+    sender_id       UUID REFERENCES users(id) ON DELETE SET NULL,
+    is_read         BOOLEAN DEFAULT FALSE,
+    read_at         TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_notifications_user ON notifications(user_id, is_read, created_at DESC);
+CREATE INDEX idx_notifications_type ON notifications(type);
+
+CREATE TABLE broadcast_notifications (
+    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    sender_id   UUID NOT NULL REFERENCES users(id),
+    title       VARCHAR(300) NOT NULL,
+    message     TEXT NOT NULL,
+    is_active   BOOLEAN DEFAULT TRUE,
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ============================================================================
+-- 18. FANDOM / BLOG POSTS
+-- ============================================================================
+
+CREATE TABLE posts (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title           VARCHAR(500) NOT NULL,
+    slug            VARCHAR(500) NOT NULL UNIQUE,
+    content         TEXT NOT NULL,
+    cover_image_url TEXT,
+    story_id        UUID REFERENCES stories(id) ON DELETE SET NULL,
+    is_published    BOOLEAN DEFAULT TRUE,
+    is_deleted      BOOLEAN DEFAULT FALSE,
+    view_count      BIGINT DEFAULT 0,
+    comment_count   INTEGER DEFAULT 0,
+    reaction_count  INTEGER DEFAULT 0,
+    published_at    TIMESTAMPTZ DEFAULT NOW(),
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_posts_user ON posts(user_id);
+CREATE INDEX idx_posts_story ON posts(story_id);
+CREATE INDEX idx_posts_slug ON posts(slug);
+CREATE INDEX idx_posts_published ON posts(published_at DESC);
+CREATE INDEX idx_posts_title_trgm ON posts USING gin(title gin_trgm_ops);
+
+CREATE TABLE post_tags (
+    post_id     UUID NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    tag_id      UUID NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+    PRIMARY KEY (post_id, tag_id)
+);
+
+CREATE TABLE post_reactions (
+    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    post_id     UUID NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    reaction    reaction_type NOT NULL,
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(post_id, user_id)
+);
+
+CREATE INDEX idx_post_reactions_post ON post_reactions(post_id);
+
+-- ============================================================================
+-- 19. BÁO CÁO (REPORTS)
+-- ============================================================================
+
+CREATE TABLE reports (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    reporter_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    target_type     VARCHAR(50) NOT NULL,
+    target_id       UUID NOT NULL,
+    reason          VARCHAR(100) NOT NULL,
+    description     TEXT,
+    status          VARCHAR(20) DEFAULT 'pending',
+    resolved_by     UUID REFERENCES users(id),
+    resolved_at     TIMESTAMPTZ,
+    resolution_note TEXT,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_reports_status ON reports(status);
+
+-- ============================================================================
+-- 20. FUNCTIONS & TRIGGERS
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_users_updated_at
+    BEFORE UPDATE ON users
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER trg_stories_updated_at
+    BEFORE UPDATE ON stories
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER trg_chapters_updated_at
+    BEFORE UPDATE ON chapters
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER trg_volumes_updated_at
+    BEFORE UPDATE ON volumes
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER trg_user_settings_updated_at
+    BEFORE UPDATE ON user_settings
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER trg_translation_groups_updated_at
+    BEFORE UPDATE ON translation_groups
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER trg_posts_updated_at
+    BEFORE UPDATE ON posts
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER trg_comments_updated_at
+    BEFORE UPDATE ON comments
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE OR REPLACE FUNCTION update_story_chapter_stats()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        UPDATE stories SET
+            total_chapters = (SELECT COUNT(*) FROM chapters WHERE story_id = NEW.story_id AND is_published = TRUE),
+            last_chapter_at = NEW.published_at
+        WHERE id = NEW.story_id;
+    ELSIF TG_OP = 'DELETE' THEN
+        UPDATE stories SET
+            total_chapters = (SELECT COUNT(*) FROM chapters WHERE story_id = OLD.story_id AND is_published = TRUE),
+            last_chapter_at = (SELECT MAX(published_at) FROM chapters WHERE story_id = OLD.story_id AND is_published = TRUE)
+        WHERE id = OLD.story_id;
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_chapter_stats
+    AFTER INSERT OR DELETE ON chapters
+    FOR EACH ROW EXECUTE FUNCTION update_story_chapter_stats();
+
+CREATE OR REPLACE FUNCTION update_story_favorites_count()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        UPDATE stories SET total_favorites = total_favorites + 1 WHERE id = NEW.story_id;
+    ELSIF TG_OP = 'DELETE' THEN
+        UPDATE stories SET total_favorites = total_favorites - 1 WHERE id = OLD.story_id;
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_favorites_count
+    AFTER INSERT OR DELETE ON user_favorites
+    FOR EACH ROW EXECUTE FUNCTION update_story_favorites_count();
+
+CREATE OR REPLACE FUNCTION update_story_rating()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'INSERT' OR TG_OP = 'UPDATE' THEN
+        UPDATE stories SET
+            rating_avg = (SELECT COALESCE(AVG(rating), 0) FROM story_ratings WHERE story_id = NEW.story_id),
+            rating_count = (SELECT COUNT(*) FROM story_ratings WHERE story_id = NEW.story_id)
+        WHERE id = NEW.story_id;
+    ELSIF TG_OP = 'DELETE' THEN
+        UPDATE stories SET
+            rating_avg = (SELECT COALESCE(AVG(rating), 0) FROM story_ratings WHERE story_id = OLD.story_id),
+            rating_count = (SELECT COUNT(*) FROM story_ratings WHERE story_id = OLD.story_id)
+        WHERE id = OLD.story_id;
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_rating_update
+    AFTER INSERT OR UPDATE OR DELETE ON story_ratings
+    FOR EACH ROW EXECUTE FUNCTION update_story_rating();
+
+CREATE OR REPLACE FUNCTION update_comment_counts()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.parent_id IS NOT NULL THEN
+            UPDATE comments SET reply_count = reply_count + 1 WHERE id = NEW.parent_id;
+        END IF;
+        IF NEW.target_type = 'chapter' THEN
+            UPDATE chapters SET total_comments = total_comments + 1 WHERE id = NEW.target_id;
+            UPDATE stories SET total_comments = total_comments + 1
+            WHERE id = (SELECT story_id FROM chapters WHERE id = NEW.target_id);
+        ELSIF NEW.target_type = 'post' THEN
+            UPDATE posts SET comment_count = comment_count + 1 WHERE id = NEW.target_id;
+        END IF;
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_comment_counts
+    AFTER INSERT ON comments
+    FOR EACH ROW EXECUTE FUNCTION update_comment_counts();
+
+CREATE OR REPLACE FUNCTION auto_grant_author_role()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.approval_status = 'approved' THEN
+        INSERT INTO user_roles (user_id, role)
+        VALUES (NEW.uploader_id, CASE
+            WHEN NEW.group_id IS NOT NULL THEN 'translator'::user_role
+            ELSE 'author'::user_role
+        END)
+        ON CONFLICT (user_id, role) DO NOTHING;
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_auto_grant_role
+    AFTER UPDATE OF approval_status ON stories
+    FOR EACH ROW
+    WHEN (NEW.approval_status = 'approved' AND OLD.approval_status != 'approved')
+    EXECUTE FUNCTION auto_grant_author_role();
+
+-- ============================================================================
+-- 21. VIEWS
+-- ============================================================================
+
+CREATE VIEW v_trending_stories AS
+SELECT
+    s.id,
+    s.title,
+    s.slug,
+    s.cover_image_url,
+    s.story_type,
+    s.status,
+    s.rating_avg,
+    s.total_views,
+    s.total_favorites,
+    COALESCE(recent.weekly_views, 0) AS weekly_views,
+    s.last_chapter_at
+FROM stories s
+LEFT JOIN (
+    SELECT story_id, COUNT(*) AS weekly_views
+    FROM story_views
+    WHERE viewed_at >= NOW() - INTERVAL '7 days'
+    GROUP BY story_id
+) recent ON s.id = recent.story_id
+WHERE s.approval_status = 'approved'
+ORDER BY weekly_views DESC, s.rating_avg DESC;
+
+CREATE VIEW v_recently_updated_stories AS
+SELECT
+    s.id,
+    s.title,
+    s.slug,
+    s.cover_image_url,
+    s.story_type,
+    s.status,
+    s.total_chapters,
+    s.last_chapter_at,
+    c.title AS latest_chapter_title,
+    c.chapter_number AS latest_chapter_number,
+    g.name AS group_name
+FROM stories s
+LEFT JOIN LATERAL (
+    SELECT title, chapter_number FROM chapters
+    WHERE story_id = s.id AND is_published = TRUE
+    ORDER BY chapter_number DESC LIMIT 1
+) c ON TRUE
+LEFT JOIN translation_groups g ON s.group_id = g.id
+WHERE s.approval_status = 'approved'
+ORDER BY s.last_chapter_at DESC NULLS LAST;
+
+
+-- ============================================================================
+-- ============================================================================
+--                          SEED DATA (Valid Hex UUIDs)
+-- ============================================================================
+-- ============================================================================
+
+-- Users (12 users)
+INSERT INTO users (id, username, email, password_hash, display_name, avatar_url, bio, email_verified) VALUES
+('a0000000-0000-0000-0000-000000000001', 'admin', 'admin@novelhub.vn', '$2b$12$LJ3m4ys3GZvX9ETJNGrUb.Kkl6VJzN1tXNOzNPPPYH8VZF5Kq7pCq', 'Administrator', '/avatars/admin.png', 'Quản trị viên hệ thống', TRUE),
+('a0000000-0000-0000-0000-000000000002', 'mod_sakura', 'sakura@novelhub.vn', '$2b$12$LJ3m4ys3GZvX9ETJNGrUb.Kkl6VJzN1tXNOzNPPPYH8VZF5Kq7pCq', 'Sakura ✿', '/avatars/sakura.png', 'Moderator | Yêu light novel', TRUE),
+('a0000000-0000-0000-0000-000000000003', 'mod_kaito', 'kaito@novelhub.vn', '$2b$12$LJ3m4ys3GZvX9ETJNGrUb.Kkl6VJzN1tXNOzNPPPYH8VZF5Kq7pCq', 'Kaito', '/avatars/kaito.png', 'Moderator | Manga enthusiast', TRUE),
+('a0000000-0000-0000-0000-000000000004', 'neko_trans', 'neko@novelhub.vn', '$2b$12$LJ3m4ys3GZvX9ETJNGrUb.Kkl6VJzN1tXNOzNPPPYH8VZF5Kq7pCq', 'Neko Translation', '/avatars/neko.png', 'Nhóm dịch Neko 🐱 | Chuyên LN Nhật', TRUE),
+('a0000000-0000-0000-0000-000000000005', 'tanuki_san', 'tanuki@novelhub.vn', '$2b$12$LJ3m4ys3GZvX9ETJNGrUb.Kkl6VJzN1tXNOzNPPPYH8VZF5Kq7pCq', 'Tanuki-san', '/avatars/tanuki.png', 'Dịch giả tự do | Fantasy & Isekai', TRUE),
+('a0000000-0000-0000-0000-000000000006', 'author_minh', 'minh@novelhub.vn', '$2b$12$LJ3m4ys3GZvX9ETJNGrUb.Kkl6VJzN1tXNOzNPPPYH8VZF5Kq7pCq', 'Minh Phương', '/avatars/minh.png', 'Tác giả web novel Việt Nam 🇻🇳', TRUE),
+('a0000000-0000-0000-0000-000000000007', 'kitsune_group', 'kitsune@novelhub.vn', '$2b$12$LJ3m4ys3GZvX9ETJNGrUb.Kkl6VJzN1tXNOzNPPPYH8VZF5Kq7pCq', 'Kitsune Group', '/avatars/kitsune.png', 'Nhóm dịch manga chuyên nghiệp', TRUE),
+('a0000000-0000-0000-0000-000000000008', 'usagi_editor', 'usagi@novelhub.vn', '$2b$12$LJ3m4ys3GZvX9ETJNGrUb.Kkl6VJzN1tXNOzNPPPYH8VZF5Kq7pCq', 'Usagi Editor', '/avatars/usagi.png', 'Editor nhóm dịch | Chỉnh sửa & Proofread', TRUE),
+('a0000000-0000-0000-0000-000000000009', 'reader_hana', 'hana@novelhub.vn', '$2b$12$LJ3m4ys3GZvX9ETJNGrUb.Kkl6VJzN1tXNOzNPPPYH8VZF5Kq7pCq', 'Hana 🌸', '/avatars/hana.png', 'Đọc truyện mỗi ngày | Romance addict', TRUE),
+('a0000000-0000-0000-0000-000000000010', 'reader_ryu', 'ryu@novelhub.vn', '$2b$12$LJ3m4ys3GZvX9ETJNGrUb.Kkl6VJzN1tXNOzNPPPYH8VZF5Kq7pCq', 'Ryū Dragon', '/avatars/ryu.png', 'Action & Adventure lover 🐉', TRUE),
+('a0000000-0000-0000-0000-000000000011', 'reader_yuki', 'yuki@novelhub.vn', '$2b$12$LJ3m4ys3GZvX9ETJNGrUb.Kkl6VJzN1tXNOzNPPPYH8VZF5Kq7pCq', 'Yuki ❄️', '/avatars/yuki.png', 'Slice of life & Comedy fan', TRUE),
+('a0000000-0000-0000-0000-000000000012', 'reader_sora', 'sora@novelhub.vn', '$2b$12$LJ3m4ys3GZvX9ETJNGrUb.Kkl6VJzN1tXNOzNPPPYH8VZF5Kq7pCq', 'Sora ☁️', '/avatars/sora.png', 'Isekai specialist', TRUE);
+
+-- User Roles
+INSERT INTO user_roles (user_id, role, is_visible, granted_by) VALUES
+('a0000000-0000-0000-0000-000000000001', 'admin', TRUE, NULL),
+('a0000000-0000-0000-0000-000000000001', 'reader', FALSE, NULL),
+('a0000000-0000-0000-0000-000000000002', 'mod', TRUE, 'a0000000-0000-0000-0000-000000000001'),
+('a0000000-0000-0000-0000-000000000002', 'reader', TRUE, NULL),
+('a0000000-0000-0000-0000-000000000003', 'mod', TRUE, 'a0000000-0000-0000-0000-000000000001'),
+('a0000000-0000-0000-0000-000000000003', 'reader', TRUE, NULL),
+('a0000000-0000-0000-0000-000000000004', 'translator', TRUE, 'a0000000-0000-0000-0000-000000000001'),
+('a0000000-0000-0000-0000-000000000004', 'reader', TRUE, NULL),
+('a0000000-0000-0000-0000-000000000005', 'translator', TRUE, 'a0000000-0000-0000-0000-000000000001'),
+('a0000000-0000-0000-0000-000000000005', 'reader', TRUE, NULL),
+('a0000000-0000-0000-0000-000000000006', 'author', TRUE, 'a0000000-0000-0000-0000-000000000001'),
+('a0000000-0000-0000-0000-000000000006', 'reader', TRUE, NULL),
+('a0000000-0000-0000-0000-000000000007', 'translator', TRUE, 'a0000000-0000-0000-0000-000000000001'),
+('a0000000-0000-0000-0000-000000000007', 'reader', TRUE, NULL),
+('a0000000-0000-0000-0000-000000000008', 'translator', TRUE, 'a0000000-0000-0000-0000-000000000001'),
+('a0000000-0000-0000-0000-000000000008', 'reader', TRUE, NULL),
+('a0000000-0000-0000-0000-000000000009', 'reader', TRUE, NULL),
+('a0000000-0000-0000-0000-000000000010', 'reader', TRUE, NULL),
+('a0000000-0000-0000-0000-000000000011', 'reader', TRUE, NULL),
+('a0000000-0000-0000-0000-000000000012', 'reader', TRUE, NULL);
+
+-- User Settings
+INSERT INTO user_settings (user_id, theme, font_family, font_size, line_height, reading_mode, text_color, background_color) VALUES
+('a0000000-0000-0000-0000-000000000001', 'dark', 'Inter', 16, 1.8, 'scroll', '#E0E0E0', '#1A1A2E'),
+('a0000000-0000-0000-0000-000000000009', 'dark', 'Noto Serif', 18, 2.0, 'scroll', '#D4D4D4', '#0F0F23'),
+('a0000000-0000-0000-0000-000000000010', 'light', 'Roboto', 15, 1.6, 'paginated', '#333333', '#FFFFFF'),
+('a0000000-0000-0000-0000-000000000011', 'sepia', 'Georgia', 17, 1.9, 'scroll', '#5B4636', '#F4ECD8'),
+('a0000000-0000-0000-0000-000000000012', 'amoled', 'Inter', 16, 1.8, 'webtoon', '#CCCCCC', '#000000');
+
+-- Tag Categories
+INSERT INTO tag_categories (id, name, label, sort_order) VALUES
+('c0000000-0000-0000-0000-000000000001', 'genre', 'Thể loại', 1),
+('c0000000-0000-0000-0000-000000000002', 'theme', 'Chủ đề', 2),
+('c0000000-0000-0000-0000-000000000003', 'demographic', 'Đối tượng', 3),
+('c0000000-0000-0000-0000-000000000004', 'format', 'Định dạng', 4),
+('c0000000-0000-0000-0000-000000000005', 'content_warning', 'Cảnh báo nội dung', 5);
+
+-- Thể loại (Genre)
+INSERT INTO tags (id, category_id, name, slug, description) VALUES
+('d0000000-0000-0000-0000-000000000001', 'c0000000-0000-0000-0000-000000000001', 'Action', 'action', 'Hành động, chiến đấu'),
+('d0000000-0000-0000-0000-000000000002', 'c0000000-0000-0000-0000-000000000001', 'Adventure', 'adventure', 'Phiêu lưu, mạo hiểm'),
+('d0000000-0000-0000-0000-000000000003', 'c0000000-0000-0000-0000-000000000001', 'Comedy', 'comedy', 'Hài hước'),
+('d0000000-0000-0000-0000-000000000004', 'c0000000-0000-0000-0000-000000000001', 'Drama', 'drama', 'Kịch tính, cảm xúc'),
+('d0000000-0000-0000-0000-000000000005', 'c0000000-0000-0000-0000-000000000001', 'Fantasy', 'fantasy', 'Giả tưởng, phép thuật'),
+('d0000000-0000-0000-0000-000000000006', 'c0000000-0000-0000-0000-000000000001', 'Horror', 'horror', 'Kinh dị'),
+('d0000000-0000-0000-0000-000000000007', 'c0000000-0000-0000-0000-000000000001', 'Mystery', 'mystery', 'Bí ẩn, trinh thám'),
+('d0000000-0000-0000-0000-000000000008', 'c0000000-0000-0000-0000-000000000001', 'Romance', 'romance', 'Lãng mạn, tình cảm'),
+('d0000000-0000-0000-0000-000000000009', 'c0000000-0000-0000-0000-000000000001', 'Sci-Fi', 'sci-fi', 'Khoa học viễn tưởng'),
+('d0000000-0000-0000-0000-000000000010', 'c0000000-0000-0000-0000-000000000001', 'Slice of Life', 'slice-of-life', 'Đời thường'),
+('d0000000-0000-0000-0000-000000000011', 'c0000000-0000-0000-0000-000000000001', 'Sports', 'sports', 'Thể thao'),
+('d0000000-0000-0000-0000-000000000012', 'c0000000-0000-0000-0000-000000000001', 'Thriller', 'thriller', 'Ly kỳ, hồi hộp'),
+('d0000000-0000-0000-0000-000000000013', 'c0000000-0000-0000-0000-000000000001', 'Supernatural', 'supernatural', 'Siêu nhiên'),
+('d0000000-0000-0000-0000-000000000014', 'c0000000-0000-0000-0000-000000000001', 'Psychological', 'psychological', 'Tâm lý'),
+('d0000000-0000-0000-0000-000000000015', 'c0000000-0000-0000-0000-000000000001', 'Historical', 'historical', 'Lịch sử'),
+('d0000000-0000-0000-0000-000000000016', 'c0000000-0000-0000-0000-000000000001', 'Mecha', 'mecha', 'Robot, cơ giới'),
+('d0000000-0000-0000-0000-000000000017', 'c0000000-0000-0000-0000-000000000001', 'Music', 'music', 'Âm nhạc'),
+('d0000000-0000-0000-0000-000000000018', 'c0000000-0000-0000-0000-000000000001', 'Ecchi', 'ecchi', 'Ecchi');
+
+-- Chủ đề (Theme)
+INSERT INTO tags (id, category_id, name, slug, description) VALUES
+('d0000000-0000-0000-0000-000000000101', 'c0000000-0000-0000-0000-000000000002', 'Isekai', 'isekai', 'Chuyển sinh sang thế giới khác'),
+('d0000000-0000-0000-0000-000000000102', 'c0000000-0000-0000-0000-000000000002', 'Harem', 'harem', 'Nhiều nhân vật nữ yêu nhân vật nam chính'),
+('d0000000-0000-0000-0000-000000000103', 'c0000000-0000-0000-0000-000000000002', 'Reverse Harem', 'reverse-harem', 'Nhiều nhân vật nam yêu nhân vật nữ chính'),
+('d0000000-0000-0000-0000-000000000104', 'c0000000-0000-0000-0000-000000000002', 'School Life', 'school-life', 'Đời sống học đường'),
+('d0000000-0000-0000-0000-000000000105', 'c0000000-0000-0000-0000-000000000002', 'Magic', 'magic', 'Phép thuật'),
+('d0000000-0000-0000-0000-000000000106', 'c0000000-0000-0000-0000-000000000002', 'Military', 'military', 'Quân sự'),
+('d0000000-0000-0000-0000-000000000107', 'c0000000-0000-0000-0000-000000000002', 'Reincarnation', 'reincarnation', 'Tái sinh, đầu thai'),
+('d0000000-0000-0000-0000-000000000108', 'c0000000-0000-0000-0000-000000000002', 'Game', 'game', 'Game, thế giới game'),
+('d0000000-0000-0000-0000-000000000109', 'c0000000-0000-0000-0000-000000000002', 'Cultivation', 'cultivation', 'Tu tiên, luyện đạo'),
+('d0000000-0000-0000-0000-000000000110', 'c0000000-0000-0000-0000-000000000002', 'Martial Arts', 'martial-arts', 'Võ thuật'),
+('d0000000-0000-0000-0000-000000000111', 'c0000000-0000-0000-0000-000000000002', 'Survival', 'survival', 'Sinh tồn'),
+('d0000000-0000-0000-0000-000000000112', 'c0000000-0000-0000-0000-000000000002', 'Overpowered MC', 'op-mc', 'Nhân vật chính mạnh vô đối'),
+('d0000000-0000-0000-0000-000000000113', 'c0000000-0000-0000-0000-000000000002', 'Time Travel', 'time-travel', 'Du hành thời gian'),
+('d0000000-0000-0000-0000-000000000114', 'c0000000-0000-0000-0000-000000000002', 'Villainess', 'villainess', 'Nữ chính là nhân vật phản diện'),
+('d0000000-0000-0000-0000-000000000115', 'c0000000-0000-0000-0000-000000000002', 'System', 'system', 'Hệ thống game/level up'),
+('d0000000-0000-0000-0000-000000000116', 'c0000000-0000-0000-0000-000000000002', 'Monsters', 'monsters', 'Quái vật'),
+('d0000000-0000-0000-0000-000000000117', 'c0000000-0000-0000-0000-000000000002', 'Demons', 'demons', 'Ma quỷ, ác quỷ'),
+('d0000000-0000-0000-0000-000000000118', 'c0000000-0000-0000-0000-000000000002', 'Virtual Reality', 'virtual-reality', 'Thực tế ảo');
+
+-- Đối tượng (Demographic)
+INSERT INTO tags (id, category_id, name, slug, description) VALUES
+('d0000000-0000-0000-0000-000000000201', 'c0000000-0000-0000-0000-000000000003', 'Shounen', 'shounen', 'Dành cho nam thiếu niên'),
+('d0000000-0000-0000-0000-000000000202', 'c0000000-0000-0000-0000-000000000003', 'Shoujo', 'shoujo', 'Dành cho nữ thiếu niên'),
+('d0000000-0000-0000-0000-000000000203', 'c0000000-0000-0000-0000-000000000003', 'Seinen', 'seinen', 'Dành cho nam trưởng thành'),
+('d0000000-0000-0000-0000-000000000204', 'c0000000-0000-0000-0000-000000000003', 'Josei', 'josei', 'Dành cho nữ trưởng thành'),
+('d0000000-0000-0000-0000-000000000205', 'c0000000-0000-0000-0000-000000000003', 'Kodomomuke', 'kodomomuke', 'Dành cho trẻ em');
+
+-- Định dạng (Format)
+INSERT INTO tags (id, category_id, name, slug, description) VALUES
+('d0000000-0000-0000-0000-000000000301', 'c0000000-0000-0000-0000-000000000004', 'Light Novel', 'light-novel', 'Tiểu thuyết nhẹ Nhật Bản'),
+('d0000000-0000-0000-0000-000000000302', 'c0000000-0000-0000-0000-000000000004', 'Web Novel', 'web-novel', 'Tiểu thuyết đăng tải trực tuyến'),
+('d0000000-0000-0000-0000-000000000303', 'c0000000-0000-0000-0000-000000000004', 'Manga', 'manga-format', 'Truyện tranh Nhật Bản'),
+('d0000000-0000-0000-0000-000000000304', 'c0000000-0000-0000-0000-000000000004', 'Manhwa', 'manhwa', 'Truyện tranh Hàn Quốc'),
+('d0000000-0000-0000-0000-000000000305', 'c0000000-0000-0000-0000-000000000004', 'Manhua', 'manhua', 'Truyện tranh Trung Quốc'),
+('d0000000-0000-0000-0000-000000000306', 'c0000000-0000-0000-0000-000000000004', 'Oneshot', 'oneshot', 'Truyện một chương');
+
+-- Cảnh báo nội dung
+INSERT INTO tags (id, category_id, name, slug, description) VALUES
+('d0000000-0000-0000-0000-000000000401', 'c0000000-0000-0000-0000-000000000005', 'Gore', 'gore', 'Bạo lực, máu me'),
+('d0000000-0000-0000-0000-000000000402', 'c0000000-0000-0000-0000-000000000005', 'Sexual Violence', 'sexual-violence', 'Bạo lực tình dục'),
+('d0000000-0000-0000-0000-000000000403', 'c0000000-0000-0000-0000-000000000005', 'Strong Language', 'strong-language', 'Ngôn ngữ mạnh');
+
+-- Nhóm dịch (Translation Groups)
+INSERT INTO translation_groups (id, name, slug, description, website_url, discord_url, created_by) VALUES
+('e0000000-0000-0000-0000-000000000001', 'Neko Translation', 'neko-translation', 'Nhóm dịch chuyên Light Novel Nhật Bản. Chất lượng là trên hết! 🐱', 'https://nekotrans.vn', 'https://discord.gg/nekotrans', 'a0000000-0000-0000-0000-000000000004'),
+('e0000000-0000-0000-0000-000000000002', 'Kitsune Scanlation', 'kitsune-scanlation', 'Nhóm scan manga chuyên nghiệp. Chuyên các bộ Shounen & Seinen 🦊', 'https://kitsune-scan.com', 'https://discord.gg/kitsune', 'a0000000-0000-0000-0000-000000000007'),
+('e0000000-0000-0000-0000-000000000003', 'Moonlit Translations', 'moonlit-translations', 'Dịch những câu chuyện dưới ánh trăng 🌙 | Romance & Drama', NULL, 'https://discord.gg/moonlit', 'a0000000-0000-0000-0000-000000000005');
+
+-- Thành viên nhóm dịch
+INSERT INTO group_members (group_id, user_id, role) VALUES
+('e0000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000004', 'leader'),
+('e0000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000008', 'member'),
+('e0000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000005', 'member'),
+('e0000000-0000-0000-0000-000000000002', 'a0000000-0000-0000-0000-000000000007', 'leader'),
+('e0000000-0000-0000-0000-000000000002', 'a0000000-0000-0000-0000-000000000008', 'member'),
+('e0000000-0000-0000-0000-000000000003', 'a0000000-0000-0000-0000-000000000005', 'leader');
+
+-- Theo dõi dịch giả
+INSERT INTO user_follows (follower_id, following_id) VALUES
+('a0000000-0000-0000-0000-000000000009', 'a0000000-0000-0000-0000-000000000004'),
+('a0000000-0000-0000-0000-000000000009', 'a0000000-0000-0000-0000-000000000005'),
+('a0000000-0000-0000-0000-000000000009', 'a0000000-0000-0000-0000-000000000006'),
+('a0000000-0000-0000-0000-000000000010', 'a0000000-0000-0000-0000-000000000007'),
+('a0000000-0000-0000-0000-000000000010', 'a0000000-0000-0000-0000-000000000004'),
+('a0000000-0000-0000-0000-000000000011', 'a0000000-0000-0000-0000-000000000005'),
+('a0000000-0000-0000-0000-000000000011', 'a0000000-0000-0000-0000-000000000006'),
+('a0000000-0000-0000-0000-000000000012', 'a0000000-0000-0000-0000-000000000004');
+
+-- Thông báo (Notifications)
+INSERT INTO notifications (user_id, type, title, message, reference_type, sender_id) VALUES
+('a0000000-0000-0000-0000-000000000009', 'system', '🎉 Chào mừng đến NovelHub!', 'Cảm ơn bạn đã đăng ký tài khoản. Hãy khám phá kho truyện đồ sộ của chúng tôi!', NULL, 'a0000000-0000-0000-0000-000000000001'),
+('a0000000-0000-0000-0000-000000000010', 'system', '🎉 Chào mừng đến NovelHub!', 'Cảm ơn bạn đã đăng ký tài khoản. Hãy khám phá kho truyện đồ sộ của chúng tôi!', NULL, 'a0000000-0000-0000-0000-000000000001'),
+('a0000000-0000-0000-0000-000000000011', 'system', '🎉 Chào mừng đến NovelHub!', 'Cảm ơn bạn đã đăng ký tài khoản. Hãy khám phá kho truyện đồ sộ của chúng tôi!', NULL, 'a0000000-0000-0000-0000-000000000001'),
+('a0000000-0000-0000-0000-000000000012', 'system', '🎉 Chào mừng đến NovelHub!', 'Cảm ơn bạn đã đăng ký tài khoản. Hãy khám phá kho truyện đồ sộ của chúng tôi!', NULL, 'a0000000-0000-0000-0000-000000000001'),
+('a0000000-0000-0000-0000-000000000008', 'group_invite', 'Lời mời tham gia nhóm dịch', 'Bạn đã được mời tham gia nhóm dịch "Neko Translation"', 'group', 'a0000000-0000-0000-0000-000000000004'),
+('a0000000-0000-0000-0000-000000000005', 'group_member_add', 'Thành viên mới trong nhóm', 'Usagi Editor đã tham gia nhóm "Neko Translation"', 'group', NULL);
+
+-- Broadcast Notifications
+INSERT INTO broadcast_notifications (sender_id, title, message) VALUES
+('a0000000-0000-0000-0000-000000000001', '📢 Cập nhật hệ thống v2.0', 'Chúng tôi vừa cập nhật giao diện mới với nhiều tính năng hấp dẫn. Hãy trải nghiệm ngay!'),
+('a0000000-0000-0000-0000-000000000001', '🎊 Sự kiện đọc truyện mùa hè', 'Tham gia sự kiện đọc truyện mùa hè để nhận badge đặc biệt! Chi tiết tại trang sự kiện.');
+
+-- Posts (Fandom/Blog)
+INSERT INTO posts (id, user_id, title, slug, content, story_id, is_published) VALUES
+('f0000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000009',
+    'Top 10 Light Novel Isekai hay nhất 2026 - Không thể bỏ lỡ!',
+    'top-10-light-novel-isekai-2026',
+    E'## Danh sách Top 10 Isekai LN hay nhất năm nay\n\nXin chào mọi người! Mình là Hana, hôm nay mình muốn chia sẻ danh sách top 10 Light Novel Isekai mà mình đã đọc trong năm 2026.\n\n### 1. Mushoku Tensei\nKinh điển không cần bàn cãi...\n\n### 2. Re:Zero\nChuyển sinh vào thế giới khác với khả năng quay về sau khi chết...\n\n### 3. Overlord\nBị kẹt trong game MMORPG với sức mạnh tối thượng...\n\nCác bạn có bộ nào muốn thêm vào danh sách không? Comment bên dưới nhé! 👇',
+    NULL, TRUE),
+('f0000000-0000-0000-0000-000000000002', 'a0000000-0000-0000-0000-000000000010',
+    'Review: Solo Leveling - Từ E-rank lên Shadow Monarch',
+    'review-solo-leveling',
+    E'## Solo Leveling - Review chi tiết\n\n**Rating: 9/10** ⭐\n\nSolo Leveling là một trong những manhwa hay nhất mình từng đọc. Câu chuyện về Sung Jin-Woo từ một hunter E-rank yếu nhất trở thành Shadow Monarch mạnh nhất thế giới.\n\n### Điểm mạnh:\n- Artwork tuyệt đẹp\n- Power progression hợp lý\n- Action scenes đỉnh cao\n\n### Điểm yếu:\n- Side characters thiếu chiều sâu\n- Ending hơi rushed\n\nTổng kết: MUST READ! 🔥',
+    NULL, TRUE),
+('f0000000-0000-0000-0000-000000000003', 'a0000000-0000-0000-0000-000000000011',
+    'Chia sẻ: Tại sao Slice of Life là thể loại tuyệt vời nhất?',
+    'tai-sao-slice-of-life-tuyet-voi',
+    E'## Slice of Life - Thể loại bị đánh giá thấp\n\nMọi người thường bỏ qua Slice of Life vì nghĩ nó "chán", nhưng thực tế đây là thể loại mang lại cảm giác thư giãn và healing nhất.\n\n### Vì sao mình yêu SoL:\n1. **Healing**: Sau một ngày mệt mỏi, SoL giúp mình thư giãn\n2. **Nhân vật chân thực**: Không cần super power, chỉ cần cuộc sống bình thường\n3. **Cảm xúc sâu sắc**: Những khoảnh khắc nhỏ nhưng đầy ý nghĩa\n\nCác bạn có thích SoL không? Bộ SoL yêu thích của bạn là gì? 🌸',
+    NULL, TRUE);
+
+-- Post Reactions
+INSERT INTO post_reactions (post_id, user_id, reaction) VALUES
+('f0000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000010', 'like'),
+('f0000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000011', 'love'),
+('f0000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000012', 'like'),
+('f0000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000004', 'love'),
+('f0000000-0000-0000-0000-000000000002', 'a0000000-0000-0000-0000-000000000009', 'wow'),
+('f0000000-0000-0000-0000-000000000002', 'a0000000-0000-0000-0000-000000000012', 'like'),
+('f0000000-0000-0000-0000-000000000003', 'a0000000-0000-0000-0000-000000000009', 'love'),
+('f0000000-0000-0000-0000-000000000003', 'a0000000-0000-0000-0000-000000000010', 'like');
+
+-- Comments
+INSERT INTO comments (id, user_id, target_type, target_id, parent_id, root_id, depth, content) VALUES
+('11000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000010', 'post', 'f0000000-0000-0000-0000-000000000001', NULL, NULL, 0, 'Danh sách hay quá! Mình cũng đang đọc Mushoku Tensei, đỉnh thật 🔥'),
+('11000000-0000-0000-0000-000000000002', 'a0000000-0000-0000-0000-000000000012', 'post', 'f0000000-0000-0000-0000-000000000001', NULL, NULL, 0, 'Thiếu Konosuba rồi bạn ơi! Bộ đó hài vãi 😂'),
+('11000000-0000-0000-0000-000000000003', 'a0000000-0000-0000-0000-000000000009', 'post', 'f0000000-0000-0000-0000-000000000001', '11000000-0000-0000-0000-000000000002', '11000000-0000-0000-0000-000000000002', 1, 'Ôi đúng rồi! Mình quên mất Konosuba! Sẽ update thêm 😅'),
+('11000000-0000-0000-0000-000000000004', 'a0000000-0000-0000-0000-000000000009', 'post', 'f0000000-0000-0000-0000-000000000002', NULL, NULL, 0, 'Mình cũng cho 9/10. Ending hơi tiếc nhưng overall vẫn là masterpiece!'),
+('11000000-0000-0000-0000-000000000005', 'a0000000-0000-0000-0000-000000000011', 'post', 'f0000000-0000-0000-0000-000000000002', NULL, NULL, 0, 'Artwork cũng là điểm mạnh lớn nhất. Mỗi panel đều như wallpaper 🖼️');
+
+-- Update stats on posts
+UPDATE posts SET
+    reaction_count = (SELECT COUNT(*) FROM post_reactions WHERE post_id = posts.id),
+    comment_count = (SELECT COUNT(*) FROM comments WHERE target_type = 'post' AND target_id = posts.id);
+
+-- Reports
+INSERT INTO reports (reporter_id, target_type, target_id, reason, description, status) VALUES
+('a0000000-0000-0000-0000-000000000009', 'comment', '11000000-0000-0000-0000-000000000001', 'spam', 'Comment này có vẻ là spam', 'pending');
+
+-- Verification block
+DO $$
+BEGIN
+    RAISE NOTICE '========================================';
+    RAISE NOTICE 'DATABASE IMPORT & SEED THÀNH CÔNG!';
+    RAISE NOTICE '========================================';
+    RAISE NOTICE 'Users: %', (SELECT COUNT(*) FROM users);
+    RAISE NOTICE 'User Roles: %', (SELECT COUNT(*) FROM user_roles);
+    RAISE NOTICE 'User Settings: %', (SELECT COUNT(*) FROM user_settings);
+    RAISE NOTICE 'Tag Categories: %', (SELECT COUNT(*) FROM tag_categories);
+    RAISE NOTICE 'Tags: %', (SELECT COUNT(*) FROM tags);
+    RAISE NOTICE 'Translation Groups: %', (SELECT COUNT(*) FROM translation_groups);
+    RAISE NOTICE 'Group Members: %', (SELECT COUNT(*) FROM group_members);
+    RAISE NOTICE 'User Follows: %', (SELECT COUNT(*) FROM user_follows);
+    RAISE NOTICE 'Notifications: %', (SELECT COUNT(*) FROM notifications);
+    RAISE NOTICE 'Broadcast Notifications: %', (SELECT COUNT(*) FROM broadcast_notifications);
+    RAISE NOTICE 'Posts: %', (SELECT COUNT(*) FROM posts);
+    RAISE NOTICE 'Post Reactions: %', (SELECT COUNT(*) FROM post_reactions);
+    RAISE NOTICE 'Comments: %', (SELECT COUNT(*) FROM comments);
+    RAISE NOTICE 'Reports: %', (SELECT COUNT(*) FROM reports);
+    RAISE NOTICE '========================================';
+END $$;
