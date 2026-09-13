@@ -229,8 +229,8 @@ export default function Navbar() {
 
                 {/* Notification Dropdown Popover */}
                 {isNotificationOpen && (
-                  <div className="absolute right-0 mt-3 w-80 sm:w-96 rounded-2xl bg-[#13131F]/98 backdrop-blur-2xl border border-white/15 shadow-2xl overflow-hidden z-50 animate-in fade-in zoom-in-95 duration-150">
-                    <div className="p-3.5 px-4 border-b border-white/10 flex items-center justify-between bg-white/[0.02]">
+                  <div className="absolute right-0 mt-3 w-80 sm:w-96 rounded-2xl bg-[#141420] border border-white/15 shadow-2xl shadow-black/80 overflow-hidden z-50 animate-in fade-in zoom-in-95 duration-150">
+                    <div className="p-3.5 px-4 border-b border-white/10 flex items-center justify-between bg-[#181828]">
                       <div className="flex items-center gap-2">
                         <Bell className="w-4 h-4 text-brand-400" />
                         <span className="text-sm font-bold text-white">Thông báo</span>
@@ -251,11 +251,14 @@ export default function Navbar() {
                       )}
                     </div>
 
-                    <div className="max-h-[380px] overflow-y-auto divide-y divide-white/5">
+                    <div className="max-h-[380px] overflow-y-auto divide-y divide-white/5 bg-[#141420]">
                       {notifications.length === 0 ? (
-                        <div className="p-8 text-center text-gray-400">
-                          <Bell className="w-8 h-8 mx-auto mb-2 text-gray-600 opacity-40" />
-                          <p className="text-xs">Bạn chưa có thông báo nào</p>
+                        <div className="p-8 text-center bg-[#141420]">
+                          <div className="w-12 h-12 rounded-2xl bg-white/5 border border-white/10 flex items-center justify-center mx-auto mb-3 text-brand-400">
+                            <Bell className="w-6 h-6" />
+                          </div>
+                          <p className="text-sm font-semibold text-white">Bạn chưa có thông báo nào</p>
+                          <p className="text-xs text-gray-400 mt-1">Khi có chương mới hoặc tương tác, thông báo sẽ hiển thị tại đây.</p>
                         </div>
                       ) : (
                         notifications.map((n) => (
@@ -279,7 +282,7 @@ export default function Navbar() {
                                 </div>
                               )}
                               {!n.is_read && (
-                                <span className="absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full bg-brand-500 ring-2 ring-[#13131F]" />
+                                <span className="absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full bg-brand-500 ring-2 ring-[#141420]" />
                               )}
                             </div>
 
