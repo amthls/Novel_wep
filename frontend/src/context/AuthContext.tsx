@@ -71,7 +71,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       ...(options.headers as Record<string, string> || {}),
     };
 
-    if (currentToken) {
+    if (currentToken && currentToken !== 'cookie_session') {
       headers['Authorization'] = `Bearer ${currentToken}`;
     }
 

@@ -149,7 +149,7 @@ export class UserReadingLog {
    */
   static async deleteLog(id: string, userId: string): Promise<boolean> {
     const result = await pool.query(
-      `DELETE FROM reading_history WHERE id = $1::uuid AND user_id = $2::uuid RETURNING id;`,
+      `DELETE FROM reading_history WHERE (id = $1::uuid OR story_id = $1::uuid) AND user_id = $2::uuid RETURNING id;`,
       [id, userId]
     );
     return result.rows.length > 0;

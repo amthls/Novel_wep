@@ -40,6 +40,7 @@ export default function StoryDetailPage() {
   const [selectedRating, setSelectedRating] = useState(10);
   const [isDeleting, setIsDeleting] = useState(false);
   const [toastMsg, setToastMsg] = useState<string | null>(null);
+  const [lastReadChapter, setLastReadChapter] = useState<{ slug: string; title?: string; chapter_number?: number } | null>(null);
 
   const showToast = (msg: string) => {
     setToastMsg(msg);
@@ -80,6 +81,39 @@ export default function StoryDetailPage() {
   useEffect(() => {
     fetchStory();
   }, [slug, isAuthenticated]);
+
+  useEffect(() => {
+    if (!slug) return;
+    const checkHistory = async () => {
+      let found: any = null;
+      if (typeof window !== 'undefined') {
+        try {
+          const raw = localStorage.getItem('novelhub_guest_history') || '[]';
+          const list = JSON.parse(raw);
+          found = list.find((h: any) => h.story_slug === slug || (story?.id && h.story_id === story.id));
+        } catch (e) {}
+      }
+      if (!found && isAuthenticated) {
+        try {
+          const res = await authFetch(`${API_BASE_URL}/history`);
+          if (res.ok) {
+            const json = await res.json();
+            if (json.success && Array.isArray(json.data)) {
+              found = json.data.find((h: any) => h.story_slug === slug || (story?.id && h.story_id === story.id));
+            }
+          }
+        } catch (e) {}
+      }
+      if (found && (found.chapter_slug || found.slug)) {
+        setLastReadChapter({
+          slug: found.chapter_slug || found.slug,
+          title: found.chapter_title,
+          chapter_number: found.chapter_number,
+        });
+      }
+    };
+    checkHistory();
+  }, [slug, story?.id, isAuthenticated, authFetch]);
 
   const handleToggleFollow = async (e?: React.MouseEvent) => {
     if (e) {
@@ -375,6 +409,18 @@ export default function StoryDetailPage() {
 
               {/* Action CTA Buttons */}
               <div className="flex flex-wrap items-center justify-center md:justify-start gap-3 pt-3">
+                {lastReadChapter ? (
+                  <Link
+                    href={`/truyen/${story.slug}/${lastReadChapter.slug}`}
+                    className="px-5 py-2.5 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-bold text-xs shadow-lg shadow-emerald-500/25 flex items-center gap-2 transition-all hover:scale-105"
+                  >
+                    <BookOpen className="w-4 h-4" />
+                    <span>
+                      Đọc tiếp {lastReadChapter.chapter_number !== undefined ? `(Chương ${lastReadChapter.chapter_number})` : ''}
+                    </span>
+                  </Link>
+                ) : null}
+
                 {story.first_chapter ? (
                   <Link
                     href={`/truyen/${story.slug}/${story.first_chapter.slug}`}

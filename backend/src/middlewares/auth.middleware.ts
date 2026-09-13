@@ -21,7 +21,7 @@ export const extractToken = (req: Request): string | null => {
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith('Bearer ')) {
     const token = authHeader.split(' ')[1];
-    if (token && token.trim()) return token.trim();
+    if (token && token.trim() && token.trim() !== 'cookie_session' && token.trim() !== 'null' && token.trim() !== 'undefined') return token.trim();
   }
   const cookies = (req as any).cookies;
   if (cookies?.token && typeof cookies.token === 'string' && cookies.token.trim()) {

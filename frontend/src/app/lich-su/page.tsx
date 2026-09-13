@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import Link from 'next/link';
 import { 
   History, 
@@ -13,8 +13,8 @@ import {
   LogIn, 
   Search, 
   Compass, 
-  Bookmark, 
-  Sparkles 
+  Sparkles,
+  X
 } from 'lucide-react';
 import SmartImage from '@/components/common/SmartImage';
 import { useAuth } from '@/context/AuthContext';
@@ -30,17 +30,20 @@ export default function ReadingHistoryPage() {
   const [searchTerm, setSearchTerm] = useState('');
   const [typeFilter, setTypeFilter] = useState<'all' | 'novel' | 'manga'>('all');
 
-  const fetchHistory = async () => {
+  const fetchHistory = useCallback(async () => {
     setIsLoading(true);
-    let list: any[] = [];
+    let guestList: any[] = [];
     if (typeof window !== 'undefined') {
       try {
         const raw = localStorage.getItem('novelhub_guest_history') || '[]';
-        list = JSON.parse(raw);
+        guestList = JSON.parse(raw);
+        if (!Array.isArray(guestList)) guestList = [];
       } catch (e) {
         console.error('Failed to parse guest history:', e);
       }
     }
+
+    let combinedList: any[] = [...guestList];
 
     if (isAuthenticated) {
       try {
@@ -49,8 +52,26 @@ export default function ReadingHistoryPage() {
           const json = await res.json();
           if (json.success && Array.isArray(json.data)) {
             const apiStoryIds = new Set(json.data.map((h: any) => h.story_id));
-            const guestOnly = list.filter((h: any) => !apiStoryIds.has(h.story_id));
-            list = [...json.data, ...guestOnly];
+            const guestOnly = guestList.filter((h: any) => !apiStoryIds.has(h.story_id));
+            combinedList = [...json.data, ...guestOnly];
+
+            // Sync any guest-only entries to server in the background
+            if (guestOnly.length > 0) {
+              guestOnly.forEach((g: any) => {
+                if (g.story_id && g.chapter_id) {
+                  authFetch(`${API_BASE_URL}/history`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      story_id: g.story_id,
+                      chapter_id: g.chapter_id,
+                      scroll_position: g.scroll_position || 0,
+                      page_number: g.page_number || 1,
+                    }),
+                  }).catch(() => {});
+                }
+              });
+            }
           }
         }
       } catch (e) {
@@ -58,22 +79,31 @@ export default function ReadingHistoryPage() {
       }
     }
 
+    // Sort by read_at DESC
+    combinedList.sort((a, b) => {
+      const timeA = new Date(a.read_at || a.updated_at || 0).getTime();
+      const timeB = new Date(b.read_at || b.updated_at || 0).getTime();
+      return timeB - timeA;
+    });
+
     // Deduplicate by story_id while keeping the most recently read chapter
     const storyMap = new Map<string, any>();
-    for (const item of list) {
+    for (const item of combinedList) {
       const key = item.story_id || item.id;
-      if (!storyMap.has(key)) {
+      if (key && !storyMap.has(key)) {
         storyMap.set(key, item);
       }
     }
 
     setHistory(Array.from(storyMap.values()));
     setIsLoading(false);
-  };
+  }, [isAuthenticated, authFetch]);
 
   useEffect(() => {
-    fetchHistory();
-  }, [isAuthenticated]);
+    if (!isAuthLoading) {
+      fetchHistory();
+    }
+  }, [isAuthLoading, isAuthenticated, fetchHistory]);
 
   const handleDeleteItem = async (item: any, e: React.MouseEvent) => {
     e.preventDefault();
@@ -82,12 +112,14 @@ export default function ReadingHistoryPage() {
     const targetId = item.id;
     const storyId = item.story_id;
 
+    // Optimistically remove from state
     setHistory(prev => prev.filter(h => {
       if (targetId && h.id && h.id === targetId) return false;
       if (storyId && h.story_id && h.story_id === storyId) return false;
       return true;
     }));
 
+    // Remove from local storage
     if (typeof window !== 'undefined') {
       try {
         const raw = localStorage.getItem('novelhub_guest_history') || '[]';
@@ -100,9 +132,10 @@ export default function ReadingHistoryPage() {
       } catch (err) {}
     }
 
+    // Delete from backend if authenticated
     if (isAuthenticated) {
-      const idToDelete = (targetId && !String(targetId).startsWith('hist-')) ? targetId : storyId;
-      if (idToDelete) {
+      const idToDelete = (storyId) ? storyId : targetId;
+      if (idToDelete && !String(idToDelete).startsWith('hist-')) {
         try {
           await authFetch(`${API_BASE_URL}/history/${idToDelete}`, { method: 'DELETE' });
         } catch (err) {
@@ -111,12 +144,13 @@ export default function ReadingHistoryPage() {
       }
     }
 
-    setFeedback('Đã xóa bộ truyện khỏi lịch sử đọc');
+    setFeedback('Đã xóa truyện khỏi lịch sử đọc');
     setTimeout(() => setFeedback(null), 3000);
   };
 
   const handleClearAll = async () => {
     if (!confirm('Bạn có chắc chắn muốn xóa toàn bộ lịch sử đọc của mình không?')) return;
+    
     setHistory([]);
     if (typeof window !== 'undefined') {
       localStorage.removeItem('novelhub_guest_history');
@@ -136,6 +170,17 @@ export default function ReadingHistoryPage() {
     if (!dateStr) return '';
     try {
       const d = new Date(dateStr);
+      const now = new Date();
+      const diffMs = now.getTime() - d.getTime();
+      const diffMinutes = Math.floor(diffMs / (1000 * 60));
+      const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
+      const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+
+      if (diffMinutes < 1) return 'Vừa xong';
+      if (diffMinutes < 60) return `${diffMinutes} phút trước`;
+      if (diffHours < 24) return `${diffHours} giờ trước`;
+      if (diffDays < 7) return `${diffDays} ngày trước`;
+
       return d.toLocaleDateString('vi-VN', {
         hour: '2-digit',
         minute: '2-digit',
@@ -148,14 +193,28 @@ export default function ReadingHistoryPage() {
     }
   };
 
+  const getChapterDisplayText = (chapNumber?: number | string, chapTitle?: string) => {
+    if (!chapTitle && chapNumber === undefined) return 'Đọc tiếp';
+    if (!chapTitle) return `Chương ${chapNumber}`;
+    if (/^(chương|chapter|ch\.|hồi)\s*\d+/i.test(chapTitle)) {
+      return chapTitle;
+    }
+    return chapNumber !== undefined ? `Chương ${chapNumber}: ${chapTitle}` : chapTitle;
+  };
+
+  // Counts for tabs
+  const novelCount = useMemo(() => history.filter(h => h.story_type === 'novel').length, [history]);
+  const mangaCount = useMemo(() => history.filter(h => h.story_type === 'manga').length, [history]);
+
   // Filtered list based on search and story type
   const filteredHistory = useMemo(() => {
     return history.filter(item => {
       const title = (item.story_title || item.title || '').toLowerCase();
       const author = (item.story_author || item.author_name || '').toLowerCase();
-      const search = searchTerm.toLowerCase();
+      const chapterTitle = (item.chapter_title || '').toLowerCase();
+      const search = searchTerm.toLowerCase().trim();
 
-      const matchesSearch = !searchTerm || title.includes(search) || author.includes(search);
+      const matchesSearch = !search || title.includes(search) || author.includes(search) || chapterTitle.includes(search);
       const matchesType = typeFilter === 'all' || item.story_type === typeFilter;
 
       return matchesSearch && matchesType;
@@ -225,7 +284,7 @@ export default function ReadingHistoryPage() {
 
       {/* 3. Feedback Notification */}
       {feedback && (
-        <div className="p-4 rounded-2xl bg-green-500/10 border border-green-500/30 text-green-300 text-xs font-semibold flex items-center gap-2 transition">
+        <div className="p-4 rounded-2xl bg-green-500/10 border border-green-500/30 text-green-300 text-xs font-semibold flex items-center gap-2 transition animate-fadeIn">
           <CheckCircle2 className="w-4 h-4 text-green-400 shrink-0" />
           {feedback}
         </div>
@@ -253,7 +312,7 @@ export default function ReadingHistoryPage() {
                 : 'text-gray-400 hover:text-white'
             }`}
           >
-            Light Novel
+            Light Novel ({novelCount})
           </button>
           <button
             onClick={() => setTypeFilter('manga')}
@@ -263,7 +322,7 @@ export default function ReadingHistoryPage() {
                 : 'text-gray-400 hover:text-white'
             }`}
           >
-            Manga
+            Manga ({mangaCount})
           </button>
         </div>
 
@@ -272,11 +331,19 @@ export default function ReadingHistoryPage() {
           <Search className="w-4 h-4 text-gray-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
           <input
             type="text"
-            placeholder="Tìm trong lịch sử..."
+            placeholder="Tìm theo tên truyện, tác giả..."
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
-            className="w-full pl-9 pr-4 py-2 rounded-xl bg-white/5 border border-white/10 text-xs text-white placeholder-gray-400 focus:outline-none focus:border-brand-500/50"
+            className="w-full pl-9 pr-9 py-2 rounded-xl bg-white/5 border border-white/10 text-xs text-white placeholder-gray-400 focus:outline-none focus:border-brand-500/50 transition"
           />
+          {searchTerm && (
+            <button
+              onClick={() => setSearchTerm('')}
+              className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          )}
         </div>
       </div>
 
@@ -300,13 +367,22 @@ export default function ReadingHistoryPage() {
               ? 'Thử thay đổi từ khóa hoặc xóa bộ lọc để tìm lại các truyện đã đọc.'
               : 'Bạn chưa đọc tác phẩm nào gần đây. Hãy chọn một bộ truyện hấp dẫn để bắt đầu ngay!'}
           </p>
-          <Link
-            href="/kham-pha"
-            className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-500 text-white text-xs font-semibold shadow-lg shadow-brand-500/25 transition"
-          >
-            <Compass className="w-4 h-4" />
-            Khám phá truyện mới
-          </Link>
+          {searchTerm || typeFilter !== 'all' ? (
+            <button
+              onClick={() => { setSearchTerm(''); setTypeFilter('all'); }}
+              className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-white/10 hover:bg-white/20 text-white text-xs font-semibold border border-white/10 transition"
+            >
+              Đặt lại bộ lọc
+            </button>
+          ) : (
+            <Link
+              href="/kham-pha"
+              className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-500 text-white text-xs font-semibold shadow-lg shadow-brand-500/25 transition"
+            >
+              <Compass className="w-4 h-4" />
+              Khám phá truyện mới
+            </Link>
+          )}
         </div>
       ) : (
         <div className="space-y-4">
@@ -321,6 +397,7 @@ export default function ReadingHistoryPage() {
             const title = item.story_title || item.title || 'Truyện không tên';
             const author = item.story_author || item.author_name || 'Chưa rõ';
             const storyType = item.story_type === 'manga' ? 'Manga' : 'Light Novel';
+            const chapterDisplay = getChapterDisplayText(item.chapter_number, item.chapter_title);
 
             return (
               <div
@@ -378,8 +455,7 @@ export default function ReadingHistoryPage() {
                         >
                           <BookOpen className="w-3.5 h-3.5 text-brand-400 shrink-0" />
                           <span className="line-clamp-1">
-                            {item.chapter_number !== undefined ? `Chương ${item.chapter_number}` : ''}
-                            {item.chapter_title ? `: ${item.chapter_title}` : ''}
+                            {chapterDisplay}
                           </span>
                         </Link>
                       </div>
@@ -397,7 +473,7 @@ export default function ReadingHistoryPage() {
                 <div className="flex items-center gap-2.5 w-full sm:w-auto justify-end pt-2 sm:pt-0 border-t sm:border-t-0 border-white/5">
                   <button
                     onClick={(e) => handleDeleteItem(item, e)}
-                    className="p-2.5 rounded-xl text-gray-400 hover:text-red-400 hover:bg-red-500/10 border border-transparent hover:border-red-500/20 transition"
+                    className="p-2.5 rounded-xl text-gray-400 hover:text-red-400 hover:bg-red-500/10 border border-transparent hover:border-red-500/20 transition cursor-pointer"
                     title="Xóa khỏi lịch sử đọc"
                   >
                     <Trash2 className="w-4 h-4" />
