@@ -1,3 +1,4 @@
+import { UserReadingLog } from '../models/readingHistory.model';
 ﻿import { Request, Response } from 'express';
 import { pool } from '../config/db';
 import { AuthenticatedRequest } from '../middlewares/auth.middleware';
@@ -545,6 +546,16 @@ export const getChapterBySlug = async (req: Request, res: Response) => {
 
     chapter.all_chapters = allChaptersRes.rows;
     chapter.story = story;
+
+    // Tự động sinh bản ghi log đọc truyện nếu người dùng đã đăng nhập
+    const currentUserId = (req as AuthenticatedRequest).user?.id;
+    if (currentUserId) {
+      UserReadingLog.recordLog({
+        userId: currentUserId,
+        storyId: story.id,
+        chapterId: chapter.id,
+      }).catch((err) => console.error('[UserReadingLog] Tự động ghi log thất bại:', err));
+    }
 
     pool.query(`
       UPDATE chapters SET total_views = total_views + 1 WHERE id = $1;

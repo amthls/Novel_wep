@@ -412,6 +412,9 @@ model UserFavorite {
   @@map("user_favorites")
 }
 
+/// Class ghi log lịch sử đọc truyện của người dùng.
+/// Nắm giữ liên kết: Người dùng (user_id) - Truyện (story_id) - Chương (chapter_id).
+/// Mỗi người dùng sở hữu các bản log độc lập riêng biệt cho mỗi lần nhấn đọc chương.
 model ReadingHistory {
   id                 String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
   user_id            String    @db.Uuid
@@ -426,7 +429,9 @@ model ReadingHistory {
   story              Story     @relation(fields: [story_id], references: [id], onDelete: Cascade)
   chapter            Chapter   @relation(fields: [chapter_id], references: [id], onDelete: Cascade)
 
-  @@unique([user_id, chapter_id])
+  @@index([user_id, chapter_id], map: "idx_reading_history_chapter")
+  @@index([user_id, read_at(sort: Desc)], map: "idx_reading_history_user")
+  @@index([story_id], map: "idx_reading_history_story")
   @@map("reading_history")
 }
 

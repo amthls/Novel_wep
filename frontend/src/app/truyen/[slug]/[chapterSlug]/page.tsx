@@ -254,7 +254,7 @@ export default function ChapterReaderPage() {
       if (!storySlug || !chapterSlug) return;
       setIsLoading(true);
       try {
-        const res = await fetch(`${API_BASE_URL}/stories/${storySlug}/chapters/${chapterSlug}`, { credentials: 'include' });
+        const res = await authFetch(`${API_BASE_URL}/stories/${storySlug}/chapters/${chapterSlug}`, { credentials: 'include' });
         if (res.ok) {
           const json = await res.json();
           if (json.success) {
@@ -269,7 +269,7 @@ export default function ChapterReaderPage() {
       }
     }
     fetchChapter();
-  }, [storySlug, chapterSlug]);
+  }, [storySlug, chapterSlug, authFetch]);
 
   const canManage = Boolean(
     hasRole('admin', 'mod') ||
